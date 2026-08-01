@@ -3,6 +3,10 @@
 **Restore Privacy Mail** — privacy-focused mail client SDK surface for rpOS /
 Restore Privacy Suite commercial deployments.
 
+## Outlook-class pillars (from-scratch variant)
+
+Mail · Calendar · Contacts · Tasks — see [docs/OUTLOOK_PARITY_SCOPE.md](docs/OUTLOOK_PARITY_SCOPE.md).
+
 ## Architecture
 
 ```
