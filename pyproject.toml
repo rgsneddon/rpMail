@@ -1,0 +1,13 @@
+[project]
+name = "rpmail"
+version = "0.1.0"
+description = "rpMail — Restore Privacy Mail (SMTP/IMAP/POP3 SDK surface)"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Raskul / Restore Privacy" }]
+
+[project.scripts]
+rpmail = "rpmail.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["rpmail*"]
