@@ -80,7 +80,7 @@ The vault document has no `seedHex` and no `spendableNanos`. Saving a mailbox do
 
 ## Host bridge
 
-Tip Continuum cannot run network mail from the vortice body alone. The bridge is `rgsneddon/shear-testnet` branch `cursor/rpmail-mail-bridge-bf30`. It touches only these surfaces:
+Tip Continuum cannot run network mail from the vortice body alone. The bridge patch is [`continuum/shear-testnet-mail-bridge.patch`](../continuum/shear-testnet-mail-bridge.patch). It applies on shear-testnet `main` (`git apply` from the repo root) and touches only these surfaces:
 
 - `wallet/lib/shear_mail_bridge.dart` — IMAP/POP3/SMTP on `dart:io`, secret file, company-role gate
 - `wallet/lib/shear_mail_pane.dart` — in-wallet mail UI
@@ -88,6 +88,8 @@ Tip Continuum cannot run network mail from the vortice body alone. The bridge is
 - `wallet/test/mail_bridge_test.dart`
 
 No invent, pool, or reconstruct edits. No default chip. Reserved program ids stay rejected. The Vortex subtree in `main.dart` does not contain the word Password (wallet tests forbid it). The mailbox field is labeled as a mailbox secret, not the Shear wallet secret.
+
+This agent could not open the shear-testnet pull request. `cursor[bot]` is denied push on `rgsneddon/shear-testnet` (HTTP 403, `permissions.push` false). Apply the patch locally and open that PR from an account that can push. `flutter test test/mail_bridge_test.dart` passed here (loopback IMAP/POP3/SMTP, secret isolation, and the pasted-pane widget). The older “Vortex deploys a third-party dapp” widget test also leaves an Argon2 fake timer pending on unmodified `main` in this environment; that failure is not from the patch.
 
 ## Known gaps
 

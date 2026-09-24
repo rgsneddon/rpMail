@@ -1,0 +1,1592 @@
+From 7521a5ca649c3efd3c698bfd625e9d8015beb9ca Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Thu, 24 Sep 2026 23:03:21 +0000
+Subject: [PATCH] Open a pasted continuum.mail vortice as an in-wallet mail
+ pane.
+
+IMAP, POP3, and SMTP run from the host only after a vort1 download whose body sets hook continuum.mail. Mailbox secrets stay in rpmail-secrets.json beside the session, not in shewall or Spendable. rpMail is not preinstalled.
+---
+ wallet/lib/main.dart              |  19 +
+ wallet/lib/shear_mail_bridge.dart | 674 ++++++++++++++++++++++++++++++
+ wallet/lib/shear_mail_pane.dart   | 346 +++++++++++++++
+ wallet/test/mail_bridge_test.dart | 483 +++++++++++++++++++++
+ 4 files changed, 1522 insertions(+)
+ create mode 100644 wallet/lib/shear_mail_bridge.dart
+ create mode 100644 wallet/lib/shear_mail_pane.dart
+ create mode 100644 wallet/test/mail_bridge_test.dart
+
+diff --git a/wallet/lib/main.dart b/wallet/lib/main.dart
+index ece1886..c8f3672 100644
+--- a/wallet/lib/main.dart
++++ b/wallet/lib/main.dart
+@@ -16,6 +16,8 @@ import 'shear_theme.dart';
+ import 'shear_ctf.dart';
+ import 'shear_ctf_cli.dart';
+ import 'shear_vortex.dart';
++import 'shear_mail_bridge.dart';
++import 'shear_mail_pane.dart';
+ import 'shear_reserve.dart';
+ import 'shear_confirm_pie.dart';
+ import 'shear_biometrics.dart';
+@@ -98,6 +100,8 @@ class ShearWalletApp extends StatefulWidget {
+     this.enforceReserveHopGate = false,
+     this.postReserveLock = false,
+     this.hopFeePay,
++    this.mailBridge,
++    this.mailSecretFile,
+   });
+ 
+   final ShearSession? session;
+@@ -136,6 +140,12 @@ class ShearWalletApp extends StatefulWidget {
+   /// seal/prove runs in [Isolate.run]. A slow hook must not run in the confirm turn.
+   final Future<void> Function()? hopFeePay;
+ 
++  /// Test hook. Production speaks IMAP, POP3, and SMTP from a pasted mail vortice.
++  final MailBridge? mailBridge;
++
++  /// Test hook. Production writes rpmail-secrets.json beside the session file.
++  final File? mailSecretFile;
++
+   @override
+   ShearWalletAppState createState() => ShearWalletAppState();
+ }
+@@ -2980,6 +2990,15 @@ class ShearWalletAppState extends State<ShearWalletApp> with WidgetsBindingObser
+         const Text(
+           'Removing it only drops it from this wallet. The vort1 origin the creator published is unchanged.',
+         ),
++        if (vorticeDeclaresMailHook(cur.source)) ...[
++          const SizedBox(height: 12),
++          VorticeMailPane(
++            key: Key('rpmail-pane-${cur.id}'),
++            vorticeId: cur.id,
++            secretFile: widget.mailSecretFile ?? mailSecretFileFor(session.store),
++            bridge: widget.mailBridge ?? const MailBridge(),
++          ),
++        ],
+         const SizedBox(height: 12),
+         OutlinedButton(
+           key: const Key('vortice-remove'),
+diff --git a/wallet/lib/shear_mail_bridge.dart b/wallet/lib/shear_mail_bridge.dart
+new file mode 100644
+index 0000000..548ae2e
+--- /dev/null
++++ b/wallet/lib/shear_mail_bridge.dart
+@@ -0,0 +1,674 @@
++import 'dart:async';
++import 'dart:convert';
++import 'dart:io';
++import 'dart:typed_data';
++
++/// Host bridge for a pasted vortice whose body sets `hook` to [kContinuumMailHook].
++///
++/// Not a preinstall. Continuum shows the mail pane only after Vortex downloads
++/// a body that declares the hook. Mailbox secrets go in [MailSecretStore],
++/// beside the session file, and are not written into shewall or Spendable.
++const kContinuumMailHook = 'continuum.mail';
++
++const _roles = ['user', 'staff', 'moderator', 'admin'];
++const _walletKeys = {
++  'seed',
++  'seedHex',
++  'seed32',
++  'spendable',
++  'spendableNanos',
++  'pendingNanos',
++  'shewall',
++};
++
++bool vorticeDeclaresMailHook(String? source) {
++  if (source == null || source.isEmpty) return false;
++  try {
++    final decoded = jsonDecode(source);
++    return decoded is Map && decoded['hook'] == kContinuumMailHook;
++  } catch (_) {
++    return false;
++  }
++}
++
++bool canCreateCompanyMailbox(String role) {
++  final have = _roles.indexOf(role);
++  final need = _roles.indexOf('moderator');
++  return have >= need && need >= 0;
++}
++
++/// `plain`, `implicit` (993 / 995 / 465), or `starttls`.
++String mailTlsMode(String protocol, int port, bool tls) {
++  if (!tls) return 'plain';
++  if (protocol == 'imap' && port == 993) return 'implicit';
++  if (protocol == 'pop3' && port == 995) return 'implicit';
++  if (protocol == 'smtp' && port == 465) return 'implicit';
++  return 'starttls';
++}
++
++File mailSecretFileFor(File sessionStore) {
++  return File('${sessionStore.parent.path}${Platform.pathSeparator}rpmail-secrets.json');
++}
++
++class MailBridgeException implements Exception {
++  MailBridgeException(this.code);
++  final String code;
++
++  @override
++  String toString() => 'MailBridgeException($code)';
++}
++
++class MailLetter {
++  const MailLetter({
++    required this.messageId,
++    required this.subject,
++    required this.fromAddr,
++    required this.toAddrs,
++    required this.body,
++    this.folder = 'INBOX',
++  });
++
++  final String messageId;
++  final String subject;
++  final String fromAddr;
++  final List<String> toAddrs;
++  final String body;
++  final String folder;
++}
++
++class MailAccountSecret {
++  const MailAccountSecret({
++    required this.accountId,
++    required this.address,
++    required this.kind,
++    required this.role,
++    required this.receive,
++    required this.host,
++    required this.port,
++    required this.tls,
++    required this.user,
++    required this.secret,
++    required this.smtpHost,
++    required this.smtpPort,
++    required this.smtpTls,
++    required this.smtpUser,
++    required this.smtpSecret,
++  });
++
++  final String accountId;
++  final String address;
++  final String kind;
++  final String role;
++  final String receive;
++  final String host;
++  final int port;
++  final bool tls;
++  final String user;
++  final String secret;
++  final String smtpHost;
++  final int smtpPort;
++  final bool smtpTls;
++  final String smtpUser;
++  final String smtpSecret;
++
++  Map<String, Object> toJson() => {
++        'accountId': accountId,
++        'address': address,
++        'kind': kind,
++        'role': role,
++        'receive': receive,
++        'host': host,
++        'port': port,
++        'tls': tls,
++        'user': user,
++        'secret': secret,
++        'smtpHost': smtpHost,
++        'smtpPort': smtpPort,
++        'smtpTls': smtpTls,
++        'smtpUser': smtpUser,
++        'smtpSecret': smtpSecret,
++      };
++
++  factory MailAccountSecret.fromJson(Map<dynamic, dynamic> json) {
++    return MailAccountSecret(
++      accountId: json['accountId']?.toString() ?? '',
++      address: json['address']?.toString() ?? '',
++      kind: json['kind']?.toString() ?? 'personal',
++      role: json['role']?.toString() ?? 'user',
++      receive: json['receive']?.toString() ?? 'imap',
++      host: json['host']?.toString() ?? '',
++      port: (json['port'] as num?)?.toInt() ?? 993,
++      tls: json['tls'] == true,
++      user: json['user']?.toString() ?? '',
++      secret: json['secret']?.toString() ?? '',
++      smtpHost: json['smtpHost']?.toString() ?? '',
++      smtpPort: (json['smtpPort'] as num?)?.toInt() ?? 587,
++      smtpTls: json['smtpTls'] == true,
++      smtpUser: json['smtpUser']?.toString() ?? '',
++      smtpSecret: json['smtpSecret']?.toString() ?? '',
++    );
++  }
++}
++
++bool jsonHasWalletMaterial(Object? value) {
++  if (value is Map) {
++    for (final key in value.keys) {
++      if (_walletKeys.contains(key.toString())) return true;
++    }
++    for (final child in value.values) {
++      if (jsonHasWalletMaterial(child)) return true;
++    }
++  } else if (value is List) {
++    for (final child in value) {
++      if (jsonHasWalletMaterial(child)) return true;
++    }
++  }
++  return false;
++}
++
++/// Mail secrets are present only in [secretFileText]. Session plain text,
++/// shewall bytes, and the spendable figure stay clear of them.
++bool mailSecretsIsolated({
++  required String secret,
++  required String smtpSecret,
++  required String secretFileText,
++  required String sessionPlain,
++  required List<int> shewallBytes,
++  required num spendableBefore,
++  required num spendableAfter,
++}) {
++  if (secret.isEmpty || !secretFileText.contains(secret)) return false;
++  if (smtpSecret.isNotEmpty && !secretFileText.contains(smtpSecret)) return false;
++  if (sessionPlain.contains(secret)) return false;
++  if (smtpSecret.isNotEmpty && sessionPlain.contains(smtpSecret)) return false;
++  if (_containsAscii(shewallBytes, secret)) return false;
++  if (smtpSecret.isNotEmpty && _containsAscii(shewallBytes, smtpSecret)) return false;
++  if (spendableBefore != spendableAfter) return false;
++  try {
++    final decoded = jsonDecode(secretFileText);
++    if (jsonHasWalletMaterial(decoded)) return false;
++  } catch (_) {
++    return false;
++  }
++  return true;
++}
++
++bool _containsAscii(List<int> haystack, String needle) {
++  final want = utf8.encode(needle);
++  if (want.isEmpty || haystack.length < want.length) return false;
++  for (var i = 0; i + want.length <= haystack.length; i++) {
++    var match = true;
++    for (var j = 0; j < want.length; j++) {
++      if (haystack[i + j] != want[j]) {
++        match = false;
++        break;
++      }
++    }
++    if (match) return true;
++  }
++  return false;
++}
++
++class MailSecretStore {
++  MailSecretStore(this.file);
++
++  final File file;
++
++  void save(String vorticeId, MailAccountSecret account) {
++    if (account.kind == 'company' && !canCreateCompanyMailbox(account.role)) {
++      throw MailBridgeException('company_mailbox_requires_moderator');
++    }
++    final root = _read();
++    final accounts = Map<String, Object>.from((root['accounts'] as Map?) ?? {});
++    accounts['$vorticeId:${account.accountId}'] = account.toJson();
++    final next = <String, Object>{'v': 1, 'accounts': accounts};
++    if (jsonHasWalletMaterial(next)) {
++      throw MailBridgeException('refusing_wallet_material');
++    }
++    file.parent.createSync(recursive: true);
++    file.writeAsStringSync('${jsonEncode(next)}\n', flush: true);
++    if (!Platform.isWindows) {
++      try {
++        Process.runSync('chmod', ['600', file.path]);
++      } catch (_) {}
++    }
++  }
++
++  MailAccountSecret? read(String vorticeId, String accountId) {
++    final accounts = (_read()['accounts'] as Map?) ?? {};
++    final row = accounts['$vorticeId:$accountId'];
++    if (row is! Map) return null;
++    return MailAccountSecret.fromJson(row);
++  }
++
++  Map<String, Object?> _read() {
++    if (!file.existsSync()) {
++      return {'v': 1, 'accounts': <String, Object>{}};
++    }
++    final decoded = jsonDecode(file.readAsStringSync());
++    if (decoded is! Map) return {'v': 1, 'accounts': <String, Object>{}};
++    return Map<String, Object?>.from(decoded);
++  }
++}
++
++class MailBridge {
++  const MailBridge();
++
++  Future<List<String>> listFolders(MailAccountSecret account) async {
++    if (account.receive == 'pop3') return const ['INBOX'];
++    final conn = await _imapLogin(account);
++    try {
++      final reply = await _imapCommand(conn, 'LIST "" "*"');
++      final folders = <String>[];
++      for (final line in reply.lines) {
++        final name = _imapListName(line);
++        if (name.isNotEmpty && !folders.contains(name)) folders.add(name);
++      }
++      return folders.isEmpty ? const ['INBOX'] : folders;
++    } finally {
++      await _closeQuiet(conn);
++    }
++  }
++
++  Future<List<MailLetter>> fetchMessages(
++    MailAccountSecret account, {
++    String folder = 'INBOX',
++    int limit = 50,
++  }) async {
++    if (account.receive == 'pop3') {
++      return _fetchPop3(account, limit: limit);
++    }
++    final conn = await _imapLogin(account);
++    try {
++      final selected = await _imapCommand(conn, 'SELECT ${_imapQuote(folder)}');
++      var count = 0;
++      for (final line in selected.lines) {
++        final match = RegExp(r'^\* (\d+) EXISTS').firstMatch(line);
++        if (match != null) count = int.parse(match.group(1)!);
++      }
++      if (count <= 0) return const [];
++      final end = count;
++      final start = count > limit ? count - limit + 1 : 1;
++      final fetched = await _imapCommand(conn, 'FETCH $start:$end (BODY.PEEK[])');
++      return [
++        for (final literal in fetched.literals) parseRfc822(literal, folder: folder),
++      ];
++    } finally {
++      await _closeQuiet(conn);
++    }
++  }
++
++  Future<String> sendMessage(
++    MailAccountSecret account, {
++    required String to,
++    required String subject,
++    required String body,
++  }) async {
++    _rejectBreak(account.address);
++    _rejectBreak(to);
++    _rejectBreak(account.smtpUser);
++    _rejectBreak(account.smtpSecret);
++    final mode = mailTlsMode('smtp', account.smtpPort, account.smtpTls);
++    var conn = await _connect(account.smtpHost, account.smtpPort, mode);
++    try {
++      await _expectPrefix(conn, '220');
++      await conn.writeLine('EHLO rpmail');
++      await _readSmtpMultiline(conn);
++      if (mode == 'starttls') {
++        await conn.writeLine('STARTTLS');
++        await _expectPrefix(conn, '220');
++        conn = await conn.upgrade(account.smtpHost);
++        await conn.writeLine('EHLO rpmail');
++        await _readSmtpMultiline(conn);
++      }
++      final token = base64Encode(utf8.encode('\x00${account.smtpUser}\x00${account.smtpSecret}'));
++      await conn.writeLine('AUTH PLAIN $token');
++      await _expectPrefix(conn, '235');
++      await conn.writeLine('MAIL FROM:<${account.address}>');
++      await _expectPrefix(conn, '250');
++      await conn.writeLine('RCPT TO:<$to>');
++      await _expectPrefix(conn, '250');
++      await conn.writeLine('DATA');
++      await _expectPrefix(conn, '354');
++      final messageId = 'rpmail-${DateTime.now().microsecondsSinceEpoch}';
++      final raw = _rfc822(
++        from: account.address,
++        to: to,
++        subject: subject,
++        body: body,
++        messageId: messageId,
++      );
++      for (final line in raw.split('\r\n')) {
++        await conn.writeLine(line.startsWith('.') ? '.$line' : line);
++      }
++      await conn.writeLine('.');
++      await _expectPrefix(conn, '250');
++      await conn.writeLine('QUIT');
++      return messageId;
++    } on MailBridgeException {
++      rethrow;
++    } catch (_) {
++      throw MailBridgeException('smtp_failed');
++    } finally {
++      await _closeQuiet(conn);
++    }
++  }
++
++  Future<List<MailLetter>> _fetchPop3(MailAccountSecret account, {required int limit}) async {
++    _rejectBreak(account.user);
++    _rejectBreak(account.secret);
++    final mode = mailTlsMode('pop3', account.port, account.tls);
++    var conn = await _connect(account.host, account.port, mode);
++    try {
++      await _expectPrefix(conn, '+OK');
++      if (mode == 'starttls') {
++        await conn.writeLine('STLS');
++        await _expectPrefix(conn, '+OK');
++        conn = await conn.upgrade(account.host);
++      }
++      await conn.writeLine('USER ${account.user}');
++      await _expectPrefix(conn, '+OK');
++      await conn.writeLine('PASS ${account.secret}');
++      await _expectPrefix(conn, '+OK');
++      await conn.writeLine('STAT');
++      final stat = await conn.readLine();
++      if (!stat.startsWith('+OK')) throw MailBridgeException('pop_stat');
++      final count = int.tryParse(stat.split(' ').elementAt(1)) ?? 0;
++      if (count <= 0) return const [];
++      final start = count > limit ? count - limit + 1 : 1;
++      final letters = <MailLetter>[];
++      for (var i = start; i <= count; i++) {
++        await conn.writeLine('RETR $i');
++        await _expectPrefix(conn, '+OK');
++        final lines = await _readDotLines(conn);
++        letters.add(parseRfc822(lines.join('\r\n'), folder: 'INBOX'));
++      }
++      await conn.writeLine('QUIT');
++      return letters;
++    } on MailBridgeException {
++      rethrow;
++    } catch (_) {
++      throw MailBridgeException('pop_failed');
++    } finally {
++      await _closeQuiet(conn);
++    }
++  }
++
++  Future<MailConn> _imapLogin(MailAccountSecret account) async {
++    _rejectBreak(account.user);
++    _rejectBreak(account.secret);
++    final mode = mailTlsMode('imap', account.port, account.tls);
++    var conn = await _connect(account.host, account.port, mode);
++    try {
++      final greet = await conn.readLine();
++      if (!greet.startsWith('* OK') && !greet.startsWith('* PREAUTH')) {
++        throw MailBridgeException('imap_greeting');
++      }
++      if (mode == 'starttls') {
++        await _imapCommand(conn, 'STARTTLS');
++        conn = await conn.upgrade(account.host);
++      }
++      await _imapCommand(conn, 'LOGIN ${_imapQuote(account.user)} ${_imapQuote(account.secret)}');
++      return conn;
++    } catch (e) {
++      await _closeQuiet(conn);
++      if (e is MailBridgeException) rethrow;
++      throw MailBridgeException('imap_login_failed');
++    }
++  }
++}
++
++class ScriptedMailBridge extends MailBridge {
++  ScriptedMailBridge({
++    this.folders = const ['INBOX'],
++    this.letters = const [],
++  });
++
++  final List<String> folders;
++  final List<MailLetter> letters;
++  final List<MailLetter> sent = [];
++
++  @override
++  Future<List<String>> listFolders(MailAccountSecret account) async => folders;
++
++  @override
++  Future<List<MailLetter>> fetchMessages(
++    MailAccountSecret account, {
++    String folder = 'INBOX',
++    int limit = 50,
++  }) async {
++    return letters.where((letter) => letter.folder == folder).take(limit).toList();
++  }
++
++  @override
++  Future<String> sendMessage(
++    MailAccountSecret account, {
++    required String to,
++    required String subject,
++    required String body,
++  }) async {
++    const id = 'scripted-sent';
++    sent.add(MailLetter(
++      messageId: id,
++      subject: subject,
++      fromAddr: account.address,
++      toAddrs: [to],
++      body: body,
++      folder: 'Sent',
++    ));
++    return id;
++  }
++}
++
++class _ImapReply {
++  const _ImapReply(this.lines, this.literals);
++  final List<String> lines;
++  final List<String> literals;
++}
++
++int _imapSeq = 0;
++
++Future<_ImapReply> _imapCommand(MailConn conn, String command) async {
++  _imapSeq += 1;
++  final tag = 'A${_imapSeq.toString().padLeft(4, '0')}';
++  await conn.writeLine('$tag $command');
++  final lines = <String>[];
++  final literals = <String>[];
++  while (true) {
++    final line = await conn.readLine();
++    if (line.startsWith('$tag ')) {
++      final rest = line.substring(tag.length + 1);
++      if (!rest.startsWith('OK')) throw MailBridgeException('imap_failed');
++      return _ImapReply(lines, literals);
++    }
++    final literal = RegExp(r'\{(\d+)\}\s*$').firstMatch(line);
++    lines.add(line);
++    if (literal != null) {
++      final bytes = await conn.readBytes(int.parse(literal.group(1)!));
++      literals.add(utf8.decode(bytes, allowMalformed: true));
++    }
++  }
++}
++
++String _imapQuote(String value) {
++  final escaped = value.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
++  return '"$escaped"';
++}
++
++String _imapListName(String line) {
++  if (!line.startsWith('* LIST')) return '';
++  final quoted = RegExp(r'"([^"]*)"\s*$').firstMatch(line);
++  if (quoted != null) return quoted.group(1) ?? '';
++  final parts = line.split(' ');
++  return parts.isEmpty ? '' : parts.last;
++}
++
++Future<MailConn> _connect(String host, int port, String mode) async {
++  try {
++    final socket = mode == 'implicit'
++        ? await SecureSocket.connect(host, port, timeout: const Duration(seconds: 20))
++        : await Socket.connect(host, port, timeout: const Duration(seconds: 20));
++    return MailConn(socket);
++  } catch (_) {
++    throw MailBridgeException('connect_failed');
++  }
++}
++
++Future<void> _expectPrefix(MailConn conn, String prefix) async {
++  final line = await conn.readLine();
++  if (!line.startsWith(prefix)) throw MailBridgeException('protocol');
++}
++
++Future<void> _readSmtpMultiline(MailConn conn) async {
++  while (true) {
++    final line = await conn.readLine();
++    if (RegExp(r'^\d{3} ').hasMatch(line)) return;
++    if (!RegExp(r'^\d{3}-').hasMatch(line)) throw MailBridgeException('smtp_ehlo');
++  }
++}
++
++Future<List<String>> _readDotLines(MailConn conn) async {
++  final lines = <String>[];
++  while (true) {
++    final line = await conn.readLine();
++    if (line == '.') break;
++    lines.add(line.startsWith('..') ? line.substring(1) : line);
++  }
++  return lines;
++}
++
++Future<void> _closeQuiet(MailConn conn) async {
++  try {
++    await conn.close();
++  } catch (_) {}
++}
++
++void _rejectBreak(String value) {
++  if (value.contains('\r') || value.contains('\n')) {
++    throw MailBridgeException('invalid_credential');
++  }
++}
++
++MailLetter parseRfc822(String raw, {String folder = 'INBOX'}) {
++  final splitAt = raw.indexOf('\r\n\r\n');
++  final alt = raw.indexOf('\n\n');
++  final cut = splitAt >= 0 ? splitAt : alt;
++  final header = cut >= 0 ? raw.substring(0, cut) : raw;
++  final body = cut >= 0 ? raw.substring(cut + (splitAt >= 0 ? 4 : 2)) : '';
++  String field(String name) {
++    final match = RegExp('^$name:\\s*(.*)\$', caseSensitive: false, multiLine: true).firstMatch(header);
++    return match?.group(1)?.trim() ?? '';
++  }
++
++  final messageId = field('Message-ID').replaceAll('<', '').replaceAll('>', '');
++  final to = field('To')
++      .split(',')
++      .map((part) => part.trim())
++      .where((part) => part.isNotEmpty)
++      .toList();
++  return MailLetter(
++    messageId: messageId.isEmpty ? 'mail-${raw.hashCode}' : messageId,
++    subject: field('Subject'),
++    fromAddr: field('From'),
++    toAddrs: to,
++    body: body.trim(),
++    folder: folder,
++  );
++}
++
++String _rfc822({
++  required String from,
++  required String to,
++  required String subject,
++  required String body,
++  required String messageId,
++}) {
++  return 'From: $from\r\nTo: $to\r\nSubject: $subject\r\nMessage-ID: <$messageId>\r\n\r\n$body';
++}
++
++class MailConn {
++  MailConn(this._socket) {
++    _sub = _socket.listen((data) {
++      _pending.addAll(data);
++      _signal();
++    }, onError: (_) {
++      _done = true;
++      _signal();
++    }, onDone: () {
++      _done = true;
++      _signal();
++    });
++  }
++
++  final Socket _socket;
++  final _pending = <int>[];
++  var _done = false;
++  var _closed = false;
++  late StreamSubscription<List<int>> _sub;
++  Completer<void>? _waiter;
++
++  void _signal() {
++    final waiter = _waiter;
++    if (waiter != null && !waiter.isCompleted) waiter.complete();
++  }
++
++  Future<void> _wait() async {
++    if (_pending.isNotEmpty || _done) return;
++    final waiter = Completer<void>();
++    _waiter = waiter;
++    if (_pending.isNotEmpty || _done) {
++      if (!waiter.isCompleted) waiter.complete();
++      return;
++    }
++    await waiter.future;
++  }
++
++  Future<String> readLine() async {
++    while (true) {
++      final cut = _crlf(_pending);
++      if (cut >= 0) {
++        final line = utf8.decode(_pending.sublist(0, cut), allowMalformed: true);
++        _pending.removeRange(0, cut + 2);
++        return line;
++      }
++      if (_pending.length > 1024 * 1024) throw MailBridgeException('line_too_long');
++      if (_done) throw MailBridgeException('closed');
++      await _wait();
++    }
++  }
++
++  Future<Uint8List> readBytes(int count) async {
++    while (_pending.length < count) {
++      if (_done) throw MailBridgeException('closed');
++      await _wait();
++    }
++    final out = Uint8List.fromList(_pending.sublist(0, count));
++    _pending.removeRange(0, count);
++    return out;
++  }
++
++  Future<void> writeLine(String line) async {
++    _socket.add(utf8.encode('$line\r\n'));
++    await _socket.flush();
++  }
++
++  Future<MailConn> upgrade(String host) async {
++    await _sub.cancel();
++    final secured = await SecureSocket.secure(_socket, host: host);
++    return MailConn(secured);
++  }
++
++  Future<void> close() async {
++    if (_closed) return;
++    _closed = true;
++    await _sub.cancel();
++    await _socket.close();
++  }
++}
++
++int _crlf(List<int> bytes) {
++  for (var i = 0; i + 1 < bytes.length; i++) {
++    if (bytes[i] == 13 && bytes[i + 1] == 10) return i;
++  }
++  return -1;
++}
+diff --git a/wallet/lib/shear_mail_pane.dart b/wallet/lib/shear_mail_pane.dart
+new file mode 100644
+index 0000000..466fa5c
+--- /dev/null
++++ b/wallet/lib/shear_mail_pane.dart
+@@ -0,0 +1,346 @@
++import 'dart:io';
++
++import 'package:flutter/material.dart';
++
++import 'shear_mail_bridge.dart';
++
++/// In-wallet mail UI for a vortice that declared [kContinuumMailHook].
++///
++/// The mailbox secret is an IMAP, POP3, or SMTP app secret. It is not the
++/// Shear wallet secret and it is not written into shewall.bin or Spendable.
++class VorticeMailPane extends StatefulWidget {
++  const VorticeMailPane({
++    super.key,
++    required this.vorticeId,
++    required this.secretFile,
++    required this.bridge,
++  });
++
++  final String vorticeId;
++  final File secretFile;
++  final MailBridge bridge;
++
++  @override
++  State<VorticeMailPane> createState() => _VorticeMailPaneState();
++}
++
++class _VorticeMailPaneState extends State<VorticeMailPane> {
++  final _address = TextEditingController();
++  final _host = TextEditingController();
++  final _port = TextEditingController(text: '993');
++  final _user = TextEditingController();
++  final _secret = TextEditingController();
++  final _smtpHost = TextEditingController();
++  final _smtpPort = TextEditingController(text: '587');
++  final _smtpUser = TextEditingController();
++  final _smtpSecret = TextEditingController();
++  final _sendTo = TextEditingController();
++  final _sendSubject = TextEditingController();
++  final _sendBody = TextEditingController();
++
++  String _kind = 'personal';
++  String _role = 'user';
++  String _receive = 'imap';
++  bool _tls = true;
++  bool _smtpTls = true;
++  String _status = '';
++  String _folder = 'INBOX';
++  List<String> _folders = const ['INBOX'];
++  List<MailLetter> _letters = const [];
++  MailLetter? _open;
++  var _busy = false;
++
++  @override
++  void dispose() {
++    for (final controller in [
++      _address,
++      _host,
++      _port,
++      _user,
++      _secret,
++      _smtpHost,
++      _smtpPort,
++      _smtpUser,
++      _smtpSecret,
++      _sendTo,
++      _sendSubject,
++      _sendBody,
++    ]) {
++      controller.dispose();
++    }
++    super.dispose();
++  }
++
++  MailAccountSecret? _draft() {
++    final address = _address.text.trim();
++    if (address.isEmpty || _host.text.trim().isEmpty) return null;
++    return MailAccountSecret(
++      accountId: address,
++      address: address,
++      kind: _kind,
++      role: _role,
++      receive: _receive,
++      host: _host.text.trim(),
++      port: int.tryParse(_port.text.trim()) ?? (_receive == 'pop3' ? 995 : 993),
++      tls: _tls,
++      user: _user.text.trim(),
++      secret: _secret.text,
++      smtpHost: _smtpHost.text.trim().isEmpty ? _host.text.trim() : _smtpHost.text.trim(),
++      smtpPort: int.tryParse(_smtpPort.text.trim()) ?? 587,
++      smtpTls: _smtpTls,
++      smtpUser: _smtpUser.text.trim().isEmpty ? _user.text.trim() : _smtpUser.text.trim(),
++      smtpSecret: _smtpSecret.text.isEmpty ? _secret.text : _smtpSecret.text,
++    );
++  }
++
++  void _save() {
++    if (_kind == 'company' && !canCreateCompanyMailbox(_role)) {
++      setState(() => _status = 'Company mailbox creation requires role moderator.');
++      return;
++    }
++    final account = _draft();
++    if (account == null) {
++      setState(() => _status = 'Address and host are required.');
++      return;
++    }
++    try {
++      MailSecretStore(widget.secretFile).save(widget.vorticeId, account);
++    } on MailBridgeException catch (e) {
++      setState(() => _status = e.code);
++      return;
++    }
++    setState(() => _status = 'Saved on this device.');
++  }
++
++  Future<void> _refresh() async {
++    final account = MailSecretStore(widget.secretFile).read(widget.vorticeId, _address.text.trim());
++    if (account == null) {
++      setState(() => _status = 'Save the account first.');
++      return;
++    }
++    setState(() => _busy = true);
++    try {
++      final folders = await widget.bridge.listFolders(account);
++      final folder = folders.contains(_folder) ? _folder : (folders.isEmpty ? 'INBOX' : folders.first);
++      final letters = await widget.bridge.fetchMessages(account, folder: folder);
++      if (!mounted) return;
++      setState(() {
++        _folders = folders;
++        _folder = folder;
++        _letters = letters;
++        _open = null;
++        _status = '${letters.length} message(s) in $folder';
++        _busy = false;
++      });
++    } on MailBridgeException catch (e) {
++      if (!mounted) return;
++      setState(() {
++        _busy = false;
++        _status = e.code;
++      });
++    }
++  }
++
++  Future<void> _send() async {
++    final account = MailSecretStore(widget.secretFile).read(widget.vorticeId, _address.text.trim());
++    if (account == null) {
++      setState(() => _status = 'Save the account first.');
++      return;
++    }
++    if (_sendTo.text.trim().isEmpty) {
++      setState(() => _status = 'Recipient is required.');
++      return;
++    }
++    setState(() => _busy = true);
++    try {
++      final id = await widget.bridge.sendMessage(
++        account,
++        to: _sendTo.text.trim(),
++        subject: _sendSubject.text,
++        body: _sendBody.text,
++      );
++      if (!mounted) return;
++      setState(() {
++        _busy = false;
++        _status = 'Sent $id';
++      });
++    } on MailBridgeException catch (e) {
++      if (!mounted) return;
++      setState(() {
++        _busy = false;
++        _status = e.code;
++      });
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return Column(
++      crossAxisAlignment: CrossAxisAlignment.start,
++      children: [
++        const Text('rpMail', style: TextStyle(fontWeight: FontWeight.w700)),
++        const Text(
++          'Mailbox secrets stay in rpmail-secrets.json on this device. '
++          'They are not the wallet backup and they are not a balance.',
++        ),
++        TextField(
++          key: const Key('rpmail-address'),
++          controller: _address,
++          decoration: const InputDecoration(labelText: 'Address'),
++        ),
++        DropdownButtonFormField<String>(
++          key: const Key('rpmail-kind'),
++          initialValue: _kind,
++          decoration: const InputDecoration(labelText: 'Kind'),
++          items: const [
++            DropdownMenuItem(value: 'personal', child: Text('personal')),
++            DropdownMenuItem(value: 'company', child: Text('company')),
++          ],
++          onChanged: (value) => setState(() => _kind = value ?? 'personal'),
++        ),
++        DropdownButtonFormField<String>(
++          key: const Key('rpmail-role'),
++          initialValue: _role,
++          decoration: const InputDecoration(labelText: 'Role'),
++          items: const [
++            DropdownMenuItem(value: 'user', child: Text('user')),
++            DropdownMenuItem(value: 'staff', child: Text('staff')),
++            DropdownMenuItem(value: 'moderator', child: Text('moderator')),
++            DropdownMenuItem(value: 'admin', child: Text('admin')),
++          ],
++          onChanged: (value) => setState(() => _role = value ?? 'user'),
++        ),
++        DropdownButtonFormField<String>(
++          key: const Key('rpmail-receive'),
++          initialValue: _receive,
++          decoration: const InputDecoration(labelText: 'Receive'),
++          items: const [
++            DropdownMenuItem(value: 'imap', child: Text('imap')),
++            DropdownMenuItem(value: 'pop3', child: Text('pop3')),
++          ],
++          onChanged: (value) {
++            final next = value ?? 'imap';
++            setState(() {
++              _receive = next;
++              if (next == 'pop3' && _port.text == '993') _port.text = '995';
++              if (next == 'imap' && _port.text == '995') _port.text = '993';
++            });
++          },
++        ),
++        TextField(
++          key: const Key('rpmail-host'),
++          controller: _host,
++          decoration: const InputDecoration(labelText: 'Host'),
++        ),
++        TextField(
++          key: const Key('rpmail-port'),
++          controller: _port,
++          decoration: const InputDecoration(labelText: 'Port'),
++          keyboardType: TextInputType.number,
++        ),
++        SwitchListTile(
++          key: const Key('rpmail-tls'),
++          contentPadding: EdgeInsets.zero,
++          title: const Text('TLS'),
++          value: _tls,
++          onChanged: (value) => setState(() => _tls = value),
++        ),
++        TextField(
++          key: const Key('rpmail-user'),
++          controller: _user,
++          decoration: const InputDecoration(labelText: 'User'),
++        ),
++        TextField(
++          key: const Key('rpmail-secret'),
++          controller: _secret,
++          obscureText: true,
++          decoration: const InputDecoration(labelText: 'Mailbox secret'),
++        ),
++        TextField(
++          key: const Key('rpmail-smtp-host'),
++          controller: _smtpHost,
++          decoration: const InputDecoration(labelText: 'SMTP host'),
++        ),
++        TextField(
++          key: const Key('rpmail-smtp-port'),
++          controller: _smtpPort,
++          decoration: const InputDecoration(labelText: 'SMTP port'),
++          keyboardType: TextInputType.number,
++        ),
++        SwitchListTile(
++          key: const Key('rpmail-smtp-tls'),
++          contentPadding: EdgeInsets.zero,
++          title: const Text('SMTP TLS'),
++          value: _smtpTls,
++          onChanged: (value) => setState(() => _smtpTls = value),
++        ),
++        TextField(
++          key: const Key('rpmail-smtp-user'),
++          controller: _smtpUser,
++          decoration: const InputDecoration(labelText: 'SMTP user'),
++        ),
++        TextField(
++          key: const Key('rpmail-smtp-secret'),
++          controller: _smtpSecret,
++          obscureText: true,
++          decoration: const InputDecoration(labelText: 'SMTP secret'),
++        ),
++        const SizedBox(height: 8),
++        FilledButton(
++          key: const Key('rpmail-save'),
++          onPressed: _busy ? null : _save,
++          child: const Text('Save account'),
++        ),
++        const SizedBox(height: 8),
++        FilledButton(
++          key: const Key('rpmail-refresh'),
++          onPressed: _busy ? null : _refresh,
++          child: const Text('Refresh mail'),
++        ),
++        if (_folders.length > 1)
++          DropdownButton<String>(
++            key: const Key('rpmail-folder'),
++            value: _folders.contains(_folder) ? _folder : _folders.first,
++            items: [
++              for (final folder in _folders) DropdownMenuItem(value: folder, child: Text(folder)),
++            ],
++            onChanged: (value) => setState(() => _folder = value ?? 'INBOX'),
++          ),
++        for (final letter in _letters)
++          ListTile(
++            key: Key('rpmail-msg-${letter.messageId}'),
++            title: Text(letter.subject.isEmpty ? '(no subject)' : letter.subject),
++            subtitle: Text(letter.fromAddr),
++            onTap: () => setState(() => _open = letter),
++          ),
++        if (_open != null) ...[
++          Text(_open!.subject, key: const Key('rpmail-open-subject')),
++          Text(_open!.body, key: const Key('rpmail-open-body')),
++        ],
++        TextField(
++          key: const Key('rpmail-send-to'),
++          controller: _sendTo,
++          decoration: const InputDecoration(labelText: 'To'),
++        ),
++        TextField(
++          key: const Key('rpmail-send-subject'),
++          controller: _sendSubject,
++          decoration: const InputDecoration(labelText: 'Subject'),
++        ),
++        TextField(
++          key: const Key('rpmail-send-body'),
++          controller: _sendBody,
++          decoration: const InputDecoration(labelText: 'Body'),
++          minLines: 2,
++          maxLines: 4,
++        ),
++        FilledButton(
++          key: const Key('rpmail-send'),
++          onPressed: _busy ? null : _send,
++          child: const Text('Send'),
++        ),
++        if (_status.isNotEmpty) Text(_status, key: const Key('rpmail-status')),
++      ],
++    );
++  }
++}
+diff --git a/wallet/test/mail_bridge_test.dart b/wallet/test/mail_bridge_test.dart
+new file mode 100644
+index 0000000..b8c9650
+--- /dev/null
++++ b/wallet/test/mail_bridge_test.dart
+@@ -0,0 +1,483 @@
++import 'dart:convert';
++import 'dart:io';
++
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:shear_wallet/main.dart';
++import 'package:shear_wallet/shear_ledger.dart';
++import 'package:shear_wallet/shear_mail_bridge.dart';
++import 'package:shear_wallet/shear_session.dart';
++import 'package:shear_wallet/shear_shewall.dart';
++import 'package:shear_wallet/shear_vortex.dart';
++
++void main() {
++  test('mail hook, tls mode, and company gate', () {
++    expect(vorticeDeclaresMailHook('{"id":"stake-pool-a","pane":"ok"}'), isFalse);
++    expect(vorticeDeclaresMailHook('{"hook":"continuum.mail","id":"rpmail-v1"}'), isTrue);
++    expect(vorticeDeclaresMailHook('not-json'), isFalse);
++    expect(canCreateCompanyMailbox('user'), isFalse);
++    expect(canCreateCompanyMailbox('staff'), isFalse);
++    expect(canCreateCompanyMailbox('moderator'), isTrue);
++    expect(canCreateCompanyMailbox('admin'), isTrue);
++    expect(mailTlsMode('imap', 993, true), 'implicit');
++    expect(mailTlsMode('imap', 143, true), 'starttls');
++    expect(mailTlsMode('imap', 143, false), 'plain');
++    expect(mailTlsMode('pop3', 995, true), 'implicit');
++    expect(mailTlsMode('pop3', 110, true), 'starttls');
++    expect(mailTlsMode('smtp', 465, true), 'implicit');
++    expect(mailTlsMode('smtp', 587, true), 'starttls');
++    expect(mailTlsMode('smtp', 25, false), 'plain');
++    final vortex = File('lib/main.dart').readAsStringSync();
++    final third = vortex.substring(
++      vortex.indexOf('Third-party vortice cannot mint SHE'),
++      vortex.indexOf('Widget _closure('),
++    );
++    expect(third.contains('Password'), isFalse);
++    expect(third.contains('vorticeDeclaresMailHook'), isTrue);
++    expect(vortex.contains("vortices = const [reserveVortice]"), isTrue);
++  });
++
++  test('loopback IMAP, POP3, and SMTP do not touch spendable', () async {
++    final box = await _Loopback.start(user: 'ada', secret: 'loop-secret');
++    addTearDown(box.close);
++    const account = MailAccountSecret(
++      accountId: 'ada@example.com',
++      address: 'ada@example.com',
++      kind: 'personal',
++      role: 'user',
++      receive: 'imap',
++      host: '127.0.0.1',
++      port: 0,
++      tls: false,
++      user: 'ada',
++      secret: 'loop-secret',
++      smtpHost: '127.0.0.1',
++      smtpPort: 0,
++      smtpTls: false,
++      smtpUser: 'ada',
++      smtpSecret: 'loop-secret',
++    );
++    final imap = MailAccountSecret(
++      accountId: account.accountId,
++      address: account.address,
++      kind: account.kind,
++      role: account.role,
++      receive: 'imap',
++      host: '127.0.0.1',
++      port: box.imapPort,
++      tls: false,
++      user: 'ada',
++      secret: 'loop-secret',
++      smtpHost: '127.0.0.1',
++      smtpPort: box.smtpPort,
++      smtpTls: false,
++      smtpUser: 'ada',
++      smtpSecret: 'loop-secret',
++    );
++    const bridge = MailBridge();
++    expect(await bridge.listFolders(imap), ['INBOX', 'Sent']);
++    final letters = await bridge.fetchMessages(imap);
++    expect(letters.single.subject, 'Hello rpMail');
++    expect(letters.single.body, contains('A private note.'));
++    final pop = MailAccountSecret(
++      accountId: imap.accountId,
++      address: imap.address,
++      kind: imap.kind,
++      role: imap.role,
++      receive: 'pop3',
++      host: '127.0.0.1',
++      port: box.popPort,
++      tls: false,
++      user: 'ada',
++      secret: 'loop-secret',
++      smtpHost: imap.smtpHost,
++      smtpPort: imap.smtpPort,
++      smtpTls: false,
++      smtpUser: imap.smtpUser,
++      smtpSecret: imap.smtpSecret,
++    );
++    final popped = await bridge.fetchMessages(pop);
++    expect(popped.single.messageId, 'm1@example.com');
++    final sentId = await bridge.sendMessage(imap, to: 'bob@example.com', subject: 'Sent live', body: 'Via SMTP.');
++    expect(sentId, startsWith('rpmail-'));
++    expect(box.sent.single, contains('Sent live'));
++    expect(box.sent.single, contains('Via SMTP.'));
++  });
++
++  test('secret file stays out of session plain text and shewall bytes', () {
++    final dir = Directory.systemTemp.createTempSync('rpmail-secrets-');
++    final session = File('${dir.path}/session.json');
++    final store = MailSecretStore(mailSecretFileFor(session));
++    const secret = 'mail-secret-9f3c';
++    const smtpSecret = 'smtp-secret-9f3c';
++    store.save(
++      'rpmail-v1',
++      const MailAccountSecret(
++        accountId: 'ada@example.com',
++        address: 'ada@example.com',
++        kind: 'personal',
++        role: 'user',
++        receive: 'imap',
++        host: 'imap.example',
++        port: 993,
++        tls: true,
++        user: 'ada',
++        secret: secret,
++        smtpHost: 'smtp.example',
++        smtpPort: 587,
++        smtpTls: true,
++        smtpUser: 'ada',
++        smtpSecret: smtpSecret,
++      ),
++    );
++    expect(
++      () => store.save(
++        'rpmail-v1',
++        const MailAccountSecret(
++          accountId: 'team@company.example',
++          address: 'team@company.example',
++          kind: 'company',
++          role: 'user',
++          receive: 'imap',
++          host: 'imap.example',
++          port: 993,
++          tls: true,
++          user: 'team',
++          secret: 'should-not-land',
++          smtpHost: 'smtp.example',
++          smtpPort: 587,
++          smtpTls: true,
++          smtpUser: 'team',
++          smtpSecret: 'should-not-land',
++        ),
++      ),
++      throwsA(isA<MailBridgeException>()),
++    );
++    expect(store.file.readAsStringSync().contains('should-not-land'), isFalse);
++    const sessionPlain = '{"vortices":[{"id":"rpmail-v1","source":"{\\"hook\\":\\"continuum.mail\\"}"}]}';
++    final shewall = utf8.encode('{"seedHex":"abcd","spendableNanos":42}');
++    expect(
++      mailSecretsIsolated(
++        secret: secret,
++        smtpSecret: smtpSecret,
++        secretFileText: store.file.readAsStringSync(),
++        sessionPlain: sessionPlain,
++        shewallBytes: shewall,
++        spendableBefore: 42,
++        spendableAfter: 42,
++      ),
++      isTrue,
++    );
++    expect(jsonHasWalletMaterial(jsonDecode(store.file.readAsStringSync())), isFalse);
++  });
++
++  testWidgets('pasted mail vortice configures, lists, and sends without Spendable', (tester) async {
++    tester.view.physicalSize = const Size(800, 2800);
++    tester.view.devicePixelRatio = 1;
++    addTearDown(tester.view.resetPhysicalSize);
++    addTearDown(tester.view.resetDevicePixelRatio);
++    final dir = Directory.systemTemp.createTempSync('rpmail-ui-');
++    final session = ShearSession(store: File('${dir.path}/session.json'));
++    await tester.runAsync(() async {
++      await session.loadOrCreate();
++      await session.setPassword('correct-horse');
++    });
++    final ledger = ShearLedger()..bindIdentity(session.identity!);
++    final before = ledger.spendableOwned(
++      session.identity!.address,
++      paymentCode: session.identity!.paymentCode,
++    );
++    const origin = 'https://rpmail.example/continuum/vortice.json';
++    const source = '{"hook":"continuum.mail","id":"rpmail-v1","pane":"rpMail","preinstall":false}';
++    final key = mintVorticeDeployKey(
++      programId: 'rpmail-v1',
++      name: 'rpMail',
++      origin: origin,
++      source: source,
++    )!;
++    final bridge = ScriptedMailBridge(
++      folders: const ['INBOX', 'Sent'],
++      letters: const [
++        MailLetter(
++          messageId: 'm1',
++          subject: 'Bridge hello',
++          fromAddr: 'bob@example.com',
++          toAddrs: ['ada@example.com'],
++          body: 'A private note.',
++        ),
++      ],
++    );
++    await tester.pumpWidget(ShearWalletApp(
++      session: session,
++      ledger: ledger,
++      startUnlocked: true,
++      skipPoolSync: true,
++      downloadVortice: (pasted) async => verifyVorticeDownload(pasted, source),
++      mailBridge: bridge,
++      mailSecretFile: File('${dir.path}/rpmail-secrets.json'),
++    ));
++    await tester.pump();
++    await tester.pump();
++    await tester.tap(find.text('Vortex'));
++    await tester.pump();
++    expect(find.byKey(const Key('rpmail-save')), findsNothing);
++    await tester.tap(find.text('Add new vortice'));
++    await tester.pump();
++    await tester.enterText(find.byKey(const Key('vortice-key')), key);
++    await tester.tap(find.text('Add vortice'));
++    await tester.pump();
++    await tester.runAsync(() async {
++      await Future<void>.delayed(const Duration(seconds: 25));
++    });
++    await tester.pump();
++    expect(find.text('rpMail'), findsWidgets);
++    expect(find.textContaining(origin), findsWidgets);
++    expect(find.byKey(const Key('rpmail-pane-rpmail-v1')), findsOneWidget);
++    await tester.ensureVisible(find.byKey(const Key('rpmail-address')));
++    await tester.enterText(find.byKey(const Key('rpmail-address')), 'ada@example.com');
++    await tester.ensureVisible(find.byKey(const Key('rpmail-host')));
++    await tester.enterText(find.byKey(const Key('rpmail-host')), 'imap.example');
++    await tester.ensureVisible(find.byKey(const Key('rpmail-user')));
++    await tester.enterText(find.byKey(const Key('rpmail-user')), 'ada');
++    await tester.ensureVisible(find.byKey(const Key('rpmail-secret')));
++    await tester.enterText(find.byKey(const Key('rpmail-secret')), 'mail-secret-9f3c');
++    await tester.ensureVisible(find.byKey(const Key('rpmail-smtp-host')));
++    await tester.enterText(find.byKey(const Key('rpmail-smtp-host')), 'smtp.example');
++    await tester.ensureVisible(find.byKey(const Key('rpmail-smtp-secret')));
++    await tester.enterText(find.byKey(const Key('rpmail-smtp-secret')), 'smtp-secret-9f3c');
++    await tester.ensureVisible(find.byKey(const Key('rpmail-kind')));
++    await tester.tap(find.byKey(const Key('rpmail-kind')));
++    await tester.pump();
++    await tester.pump(const Duration(milliseconds: 300));
++    await tester.tap(find.text('company').last);
++    await tester.pump();
++    await tester.pump(const Duration(milliseconds: 300));
++    await tester.ensureVisible(find.byKey(const Key('rpmail-save')));
++    await tester.tap(find.byKey(const Key('rpmail-save')));
++    await tester.pump();
++    expect(find.text('Company mailbox creation requires role moderator.'), findsOneWidget);
++    expect(File('${dir.path}/rpmail-secrets.json').existsSync(), isFalse);
++
++    await tester.ensureVisible(find.byKey(const Key('rpmail-kind')));
++    await tester.tap(find.byKey(const Key('rpmail-kind')));
++    await tester.pump();
++    await tester.pump(const Duration(milliseconds: 300));
++    await tester.tap(find.text('personal').last);
++    await tester.pump();
++    await tester.pump(const Duration(milliseconds: 300));
++    await tester.ensureVisible(find.byKey(const Key('rpmail-save')));
++    await tester.tap(find.byKey(const Key('rpmail-save')));
++    await tester.pump();
++    expect(find.text('Saved on this device.'), findsOneWidget);
++    final secretFile = File('${dir.path}/rpmail-secrets.json').readAsStringSync();
++    expect(secretFile, contains('mail-secret-9f3c'));
++    expect(secretFile, contains('smtp-secret-9f3c'));
++    final plain = jsonEncode(session.deployedVortices.map((v) => v.toJson()).toList());
++    expect(plain.contains('mail-secret-9f3c'), isFalse);
++    await tester.runAsync(() => session.persist());
++    expect(session.store.readAsStringSync().contains('mail-secret-9f3c'), isFalse);
++    final packed = exportShewall(
++      identity: session.identity!,
++      ledger: ledger,
++      vortices: session.deployedVortices,
++    );
++    expect(_containsBytes(packed, utf8.encode('mail-secret-9f3c')), isFalse);
++    expect(_containsBytes(packed, utf8.encode('smtp-secret-9f3c')), isFalse);
++    expect(
++      ledger.spendableOwned(session.identity!.address, paymentCode: session.identity!.paymentCode),
++      before,
++    );
++
++    await tester.ensureVisible(find.byKey(const Key('rpmail-refresh')));
++    await tester.tap(find.byKey(const Key('rpmail-refresh')));
++    await tester.pump();
++    await tester.pump(const Duration(milliseconds: 50));
++    expect(find.text('Bridge hello'), findsOneWidget);
++    await tester.tap(find.text('Bridge hello'));
++    await tester.pump();
++    expect(find.text('A private note.'), findsOneWidget);
++
++    await tester.ensureVisible(find.byKey(const Key('rpmail-send-to')));
++    await tester.enterText(find.byKey(const Key('rpmail-send-to')), 'bob@example.com');
++    await tester.enterText(find.byKey(const Key('rpmail-send-subject')), 'Out');
++    await tester.enterText(find.byKey(const Key('rpmail-send-body')), 'Reply');
++    await tester.ensureVisible(find.byKey(const Key('rpmail-send')));
++    await tester.tap(find.byKey(const Key('rpmail-send')));
++    await tester.pump();
++    await tester.pump(const Duration(milliseconds: 50));
++    expect(bridge.sent.single.subject, 'Out');
++    expect(bridge.sent.single.body, 'Reply');
++    expect(find.textContaining('Sent scripted-sent'), findsOneWidget);
++    expect(find.byKey(const Key('vortice-remove')), findsOneWidget);
++  });
++}
++
++bool _containsBytes(List<int> haystack, List<int> needle) {
++  if (needle.isEmpty || haystack.length < needle.length) return false;
++  for (var i = 0; i + needle.length <= haystack.length; i++) {
++    var match = true;
++    for (var j = 0; j < needle.length; j++) {
++      if (haystack[i + j] != needle[j]) {
++        match = false;
++        break;
++      }
++    }
++    if (match) return true;
++  }
++  return false;
++}
++
++class _Loopback {
++  _Loopback(this.imapPort, this.popPort, this.smtpPort, this._sockets, this.sent);
++
++  final int imapPort;
++  final int popPort;
++  final int smtpPort;
++  final List<ServerSocket> _sockets;
++  final List<String> sent;
++  static const _message = 'From: bob@example.com\r\n'
++      'To: ada@example.com\r\n'
++      'Subject: Hello rpMail\r\n'
++      'Message-ID: <m1@example.com>\r\n'
++      '\r\n'
++      'A private note.\r\n';
++
++  static Future<_Loopback> start({required String user, required String secret}) async {
++    final sent = <String>[];
++    final imap = await _listen((socket) => _imap(socket, user, secret));
++    final pop = await _listen((socket) => _pop(socket, user, secret));
++    final smtp = await _listen((socket) => _smtp(socket, user, secret, sent));
++    return _Loopback(imap.port, pop.port, smtp.port, [imap, pop, smtp], sent);
++  }
++
++  Future<void> close() async {
++    for (final socket in _sockets) {
++      await socket.close();
++    }
++  }
++
++  static Future<ServerSocket> _listen(void Function(Socket) onSocket) async {
++    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
++    server.listen(onSocket);
++    return server;
++  }
++
++  static Future<void> _imap(Socket socket, String user, String secret) async {
++    final reader = socket.cast<List<int>>().transform(utf8.decoder).transform(const LineSplitter());
++    void send(String line) => socket.write('$line\r\n');
++    send('* OK rpmail ready');
++    var authed = false;
++    await for (final line in reader) {
++      final parts = line.split(' ');
++      if (parts.length < 2) continue;
++      final tag = parts[0];
++      final cmd = parts[1].toUpperCase();
++      final rest = parts.length > 2 ? line.substring(tag.length + cmd.length + 2) : '';
++      if (cmd == 'CAPABILITY') {
++        send('* CAPABILITY IMAP4rev1');
++        send('$tag OK CAPABILITY completed');
++      } else if (cmd == 'LOGIN') {
++        authed = rest.contains(user) && rest.contains(secret);
++        send(authed ? '$tag OK LOGIN completed' : '$tag NO LOGIN failed');
++      } else if (cmd == 'LIST') {
++        send('* LIST (\\HasNoChildren) "/" "INBOX"');
++        send('* LIST (\\HasNoChildren) "/" "Sent"');
++        send('$tag OK LIST completed');
++      } else if (cmd == 'SELECT' || cmd == 'EXAMINE') {
++        send('* 1 EXISTS');
++        send('* 0 RECENT');
++        send('$tag OK [READ-WRITE] SELECT completed');
++      } else if (cmd == 'FETCH') {
++        final bytes = utf8.encode(_message);
++        send('* 1 FETCH (BODY[] {${bytes.length}}');
++        socket.add(bytes);
++        send(')');
++        send('$tag OK FETCH completed');
++      } else if (cmd == 'LOGOUT') {
++        send('$tag OK LOGOUT completed');
++        await socket.close();
++        return;
++      } else if (cmd == 'NOOP' || cmd == 'STARTTLS') {
++        send('$tag OK completed');
++      } else {
++        send('$tag BAD $cmd');
++      }
++    }
++  }
++
++  static Future<void> _pop(Socket socket, String user, String secret) async {
++    final reader = socket.cast<List<int>>().transform(utf8.decoder).transform(const LineSplitter());
++    void send(String line) => socket.write('$line\r\n');
++    send('+OK rpmail pop3');
++    var authed = false;
++    var gotUser = '';
++    await for (final line in reader) {
++      final cmd = line.split(' ').first.toUpperCase();
++      final arg = line.contains(' ') ? line.substring(line.indexOf(' ') + 1) : '';
++      if (cmd == 'USER') {
++        gotUser = arg;
++        send('+OK');
++      } else if (cmd == 'PASS') {
++        authed = gotUser == user && arg == secret;
++        send(authed ? '+OK' : '-ERR');
++      } else if (cmd == 'STAT') {
++        send('+OK 1 ${_message.length}');
++      } else if (cmd == 'RETR') {
++        send('+OK');
++        for (final row in _message.split('\r\n')) {
++          send(row);
++        }
++        send('.');
++      } else if (cmd == 'QUIT') {
++        send('+OK');
++        await socket.close();
++        return;
++      } else {
++        send('-ERR');
++      }
++    }
++  }
++
++  static Future<void> _smtp(Socket socket, String user, String secret, List<String> sent) async {
++    final reader = socket.cast<List<int>>().transform(utf8.decoder).transform(const LineSplitter());
++    void send(String line) => socket.write('$line\r\n');
++    send('220 rpmail smtp');
++    var authed = false;
++    var data = false;
++    final buf = StringBuffer();
++    await for (final line in reader) {
++      if (data) {
++        if (line == '.') {
++          data = false;
++          sent.add(buf.toString());
++          send('250 queued');
++        } else {
++          buf.writeln(line.startsWith('..') ? line.substring(1) : line);
++        }
++        continue;
++      }
++      final cmd = line.split(' ').first.toUpperCase();
++      if (cmd == 'EHLO' || cmd == 'HELO') {
++        send('250-rpmail');
++        send('250 AUTH PLAIN');
++      } else if (cmd == 'AUTH') {
++        final token = line.split(' ').last;
++        final raw = utf8.decode(base64Decode(token));
++        final parts = raw.split('\x00');
++        authed = parts.length >= 3 && parts[1] == user && parts[2] == secret;
++        send(authed ? '235 ok' : '535 denied');
++      } else if (cmd == 'MAIL' || cmd == 'RCPT') {
++        send(authed ? '250 ok' : '530 auth');
++      } else if (cmd == 'DATA') {
++        send('354 end');
++        data = true;
++      } else if (cmd == 'QUIT') {
++        send('221 bye');
++        await socket.close();
++        return;
++      } else {
++        send('250 ok');
++      }
++    }
++  }
++}
+-- 
+2.43.0
+
