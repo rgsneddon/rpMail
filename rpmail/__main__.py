@@ -7,6 +7,17 @@ import json
 import time
 
 from . import PRODUCT_FAMILY, PRODUCT_NAME, __version__
+from .client import MailClient
+from .continuum import (
+    DISPLAY_NAME,
+    INSTALL_KEY_UNTIL_SMOKE,
+    MAIL_HOOK,
+    PROGRAM_ID,
+    body_document,
+    pinned_body_sha256,
+)
+from .credentials import CredentialVault, assert_credential_isolation
+from .live import Endpoint
 from .models import MailAccount, MailMessage
 from .parity_scope import matrix_as_dict, required_pillars_present
 from .protocols import InMemoryImapImporter, InMemorySmtpSender
@@ -60,6 +71,26 @@ def smoke() -> dict:
 
     raw = store.dumps()
     roundtrip = MailboxStore.loads(raw)
+    vault = CredentialVault()
+    shewall = {"seedHex": "11" * 32, "spendableNanos": 1, "pendingNanos": 0}
+    mail = MailClient(store, vault, imap=imap, smtp=smtp)
+    mail.configure(
+        actor=user,
+        address="me@personal.example",
+        receive="imap",
+        imap=Endpoint("imap.example", 993, True, "me"),
+        imap_secret="smoke-mail-secret",
+        smtp=Endpoint("smtp.example", 587, True, "me"),
+        smtp_secret="smoke-smtp-secret",
+        account_id="smoke-mail",
+    )
+    isolation = assert_credential_isolation(
+        store=store,
+        vault=vault,
+        shewall=shewall,
+        secrets=["smoke-mail-secret", "smoke-smtp-secret"],
+    )
+    doc = body_document()
     return {
         "ok": True,
         "product": PRODUCT_NAME,
@@ -92,6 +123,16 @@ def smoke() -> dict:
         "company_gate_blocks_user": user_ok,
         "parity_required_ok": required_pillars_present(),
         "parity": matrix_as_dict(),
+        "continuum": {
+            "programId": PROGRAM_ID,
+            "name": DISPLAY_NAME,
+            "hook": MAIL_HOOK,
+            "installKey": INSTALL_KEY_UNTIL_SMOKE,
+            "preinstall": doc.get("preinstall"),
+            "bodySha256": pinned_body_sha256(),
+            "isolationOk": isolation["secrets_in_vault"] and not isolation["secrets_in_store"],
+            "spendableNanos": shewall["spendableNanos"],
+        },
     }
 
 
