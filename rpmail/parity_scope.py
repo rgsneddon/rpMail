@@ -22,6 +22,7 @@ OUTLOOK_PARITY_MATRIX: list[dict[str, str]] = [
     {"pillar": "Calendar", "feature": "Shared free-busy / Graph", "status": "planned"},
     {"pillar": "Contacts", "feature": "Distribution lists", "status": "planned"},
     {"pillar": "Mail", "feature": "MAPI / .pst / Exchange live", "status": "planned"},
+    {"pillar": "Mail", "feature": "Continuum vort1 mail client (IMAP/POP3/SMTP, isolated credentials)", "status": "implemented"},
 ]
 
 

@@ -1,0 +1,20 @@
+{
+  "companyMailbox": "moderator",
+  "credentials": "isolated",
+  "hook": "continuum.mail",
+  "id": "rpmail-v1",
+  "install": "vort1-paste-only",
+  "isolateFrom": [
+    "shewall",
+    "spendable"
+  ],
+  "name": "rpMail",
+  "pane": "rpMail",
+  "preinstall": false,
+  "protocols": [
+    "imap",
+    "pop3",
+    "smtp"
+  ],
+  "v": 1
+}

@@ -19,9 +19,10 @@ Status: **implemented** | **partial** | **planned**
 | Multi-account mailboxes | partial | Account model + store; no live Exchange |
 | Folders (INBOX/Sent/Drafts/custom) | partial | Folder field on messages; folder list helpers |
 | Compose / Reply / Forward models | partial | Compose + send path; reply/forward draft helpers |
-| SMTP send | implemented | Interface + in-memory sender |
-| IMAP import | implemented | Interface + in-memory importer |
-| POP3 import | implemented | Interface + in-memory importer |
+| SMTP send | implemented | Interface + in-memory sender + stdlib SMTP |
+| IMAP import | implemented | Interface + in-memory importer + stdlib IMAP |
+| POP3 import | implemented | Interface + in-memory importer + stdlib POP3 |
+| Continuum vort1 client | implemented | `continuum/vortice.json` (`hook: continuum.mail`). Install string `vort1:TODO-rpmail` until smoke. See docs/HANDOFF.md |
 | Search / rules / categories | planned | Domain hooks reserved |
 | Attachments | planned | Message attachment list scaffold optional |
 | Signatures / templates | planned | |
